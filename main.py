@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI, Header, HTTPException
 from models import QuestionRequest, AnswerResponse
-from rag import ingest_and_answer_then_cleanup
+from rag import pipeline
 import uvicorn
 from dotenv import load_dotenv
 load_dotenv()
@@ -15,17 +15,23 @@ logger = logging.getLogger(__name__)
 
 API_KEY_EXPECTED = os.getenv("HACKRX_API_KEY")
 
-app = FastAPI(title="Querylith API", version="0.1.0")
+app = FastAPI(title="Querylith API", version="0.2.0")
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
-def run_qa(payload:QuestionRequest, authorization: str = Header(...)):
+async def run_qa(payload: QuestionRequest, authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Malformed token")
     if authorization.removeprefix("Bearer ").strip() != API_KEY_EXPECTED:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    logger.info("Starting pipeline...")
+    try:
+        answers = await pipeline(str(payload.documents), payload.questions)
+        logger.info("pipeline successfully")
+        return {"answers": answers}
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        raise HTTPException(status_code=500, detail="Processing failed")
 
-    logger.info("Ingesting and Answering...")
-    answers = ingest_and_answer_then_cleanup(payload.documents, payload.questions)
-    logger.info("Answered")
-    return {"answers": answers}
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
