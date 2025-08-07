@@ -13,7 +13,6 @@ from sentence_transformers import SentenceTransformer
 from langchain_together import ChatTogether
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.prompts import PromptTemplate
 from langchain.schema import HumanMessage
 import os
 from dotenv import load_dotenv
@@ -30,11 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-qa_logger = logging.getLogger("QA_Details")
 qa_handler = logging.FileHandler("qa_pipeline_log.json")
 qa_handler.setFormatter(logging.Formatter("%(message)s"))
-qa_logger.addHandler(qa_handler)
-qa_logger.setLevel(logging.INFO)
 
 def safe_json_serialize(obj: Any) -> Any:
     if isinstance(obj, (np.integer, np.int64, np.int32)):
@@ -62,31 +58,25 @@ def safe_json_dumps(obj: Any, **kwargs) -> str:
     except TypeError:
         safe_obj = safe_json_serialize(obj)
         return json.dumps(safe_obj, **kwargs)
-
 _embedding_model = None
 _together_model_1 = None
 _together_model_2 = None
-
+_together_model_3 = None
 @lru_cache(maxsize=50)
 def get_cached_document_hash(pdf_url: str) -> str:
-    """Generate a hash for the PDF URL for caching purposes"""
     return hashlib.md5(pdf_url.encode()).hexdigest()
-
 document_cache = {}
 answer_cache = {}
 
 def get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
-        logger.info("embedding model...")
         _embedding_model = SentenceTransformer("all-MiniLM-L6-v2", trust_remote_code=True)
-        logger.info("Embedding model loaded")
     return _embedding_model
 
 def get_together_model_1():
     global _together_model_1
     if _together_model_1 is None:
-        logger.info("Together API model 1...")
         
         api_key = os.getenv("TOGETHER_API_KEY_1")
         if not api_key:
@@ -97,14 +87,11 @@ def get_together_model_1():
             model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
             temperature=0.5
         )
-        logger.info("Together API model 1 loaded")
     return _together_model_1
 
 def get_together_model_2():
     global _together_model_2
     if _together_model_2 is None:
-        logger.info("Together API model 2...")
-        
         api_key = os.getenv("TOGETHER_API_KEY_2")
         if not api_key:
             raise ValueError("TOGETHER_API_KEY_2 environment variable not set")
@@ -114,31 +101,50 @@ def get_together_model_2():
             model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
             temperature=0.5
         )
-        logger.info("Together API model 2 loaded")
     return _together_model_2
+
+def get_together_model_3():
+    global _together_model_3
+    if _together_model_3 is None:
+        api_key = os.getenv("TOGETHER_API_KEY_3")
+        if not api_key:
+            raise ValueError("TOGETHER_API_KEY_3 environment variable not set")
+            
+        _together_model_3 = ChatTogether(
+            together_api_key=api_key,
+            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+            temperature=0.5
+        )
+    return _together_model_3
 
 def get_llm_model(model_instance: str):
     if model_instance == "model_1":
         return get_together_model_1()
     elif model_instance == "model_2":
         return get_together_model_2()
+    elif model_instance == "model_3":
+        return get_together_model_3()
     else:
         raise ValueError(f"Unknown model instance: {model_instance}")
 
-def assign_models_to_questions(questions: List[str]) -> Dict[int, str]:
-    """split 50/50"""
+def assign_questions_to_models(questions: List[str]) -> Dict[str, List[int]]:
     total_questions = len(questions)
-    mid_point = total_questions // 2
+    questions_per_model = total_questions // 3
+    remainder = total_questions % 3
     
-    assignments = {}
-    for i in range(mid_point):
-        assignments[i] = "model_1"
-    for i in range(mid_point, total_questions):
-        assignments[i] = "model_2"
+    current_index = 0
+    model_assignments = {}
+    model_1_count = questions_per_model + (1 if remainder > 0 else 0)
+    model_assignments["model_1"] = list(range(current_index, current_index + model_1_count))
+    current_index += model_1_count
+
+    model_2_count = questions_per_model + (1 if remainder > 1 else 0)
+    model_assignments["model_2"] = list(range(current_index, current_index + model_2_count))
+    current_index += model_2_count
+
+    model_assignments["model_3"] = list(range(current_index, total_questions))
     
-    model_1_count = sum(1 for m in assignments.values() if m == "model_1")
-    model_2_count = sum(1 for m in assignments.values() if m == "model_2")
-    return assignments
+    return model_assignments
 
 def preprocess_text(text: str) -> str:
     text = re.sub(r'\s+', ' ', text)
@@ -157,13 +163,13 @@ async def download_pdf_async(pdf_url: str) -> bytes:
     return await loop.run_in_executor(None, download_pdf)
 
 def extract_text_from_pdf(pdf_content: bytes) -> List[Document]:
-    logger.info("Extracting text from PDF...")
     try:
         import fitz
         if hasattr(fitz, 'open'):
             return extract_with_pymupdf(pdf_content)
     except (ImportError, AttributeError) as e:
         logger.warning(f"PyMuPDF not available: {e}")
+
     try:
         from PyPDF2 import PdfReader
         return extract_with_pypdf2(pdf_content)
@@ -174,6 +180,7 @@ def extract_text_from_pdf(pdf_content: bytes) -> List[Document]:
         return extract_with_pdfplumber(pdf_content)
     except ImportError:
         logger.error("No PDF processing library available")
+        raise ImportError("Please install one of: PyMuPDF, PyPDF2, or pdfplumber")
 
 def extract_with_pymupdf(pdf_content: bytes) -> List[Document]:
     import fitz
@@ -214,7 +221,6 @@ def extract_with_pypdf2(pdf_content: bytes) -> List[Document]:
                     metadata={"page": page_num + 1}
                 )
                 docs.append(doc)
-    
     return docs
 
 def extract_with_pdfplumber(pdf_content: bytes) -> List[Document]:
@@ -235,10 +241,10 @@ def extract_with_pdfplumber(pdf_content: bytes) -> List[Document]:
                         metadata={"page": page_num + 1}
                     )
                     docs.append(doc)
-    
     return docs
 
 def fast_chunk_documents(docs: List[Document]) -> List[Document]:
+    
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
         chunk_overlap=100,
@@ -246,10 +252,10 @@ def fast_chunk_documents(docs: List[Document]) -> List[Document]:
     )
     
     chunks = splitter.split_documents(docs)
-    logger.info(f"Created {len(chunks)} chunks")
     return chunks
 
-def vectorized_similarity_search(chunks: List[Document], questions: List[str]) -> Dict[int, List[Tuple[float, Document]]]:    
+def vectorized_similarity_search(chunks: List[Document], questions: List[str]) -> Dict[int, List[Tuple[float, Document]]]:
+    
     model = get_embedding_model()
     chunk_texts = [chunk.page_content for chunk in chunks]
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -258,11 +264,12 @@ def vectorized_similarity_search(chunks: List[Document], questions: List[str]) -
         
         chunk_embeddings = chunk_emb_future.result()
         question_embeddings = question_emb_future.result()
+
     similarity_matrix = cosine_similarity(question_embeddings, chunk_embeddings)
 
     results = {}
     for q_idx, similarities in enumerate(similarity_matrix):
-        top_k_indices = np.argsort(similarities)[-3:][::-1]
+        top_k_indices = np.argsort(similarities)[-2:][::-1]
         top_similarities = similarities[top_k_indices]
         question = questions[q_idx]
         threshold = 0.3
@@ -291,234 +298,205 @@ def vectorized_similarity_search(chunks: List[Document], questions: List[str]) -
         chunk_selection_log["selected_chunks_count"] = int(len(relevant_chunks))
         
         try:
-            qa_logger.info(safe_json_dumps({
-                "event": "chunk_selection",
-                "data": chunk_selection_log
-            }, indent=2))
+            pass
         except Exception as e:
             logger.error(f"Failed to log chunk selection: {e}")
         
         results[q_idx] = relevant_chunks
-    
-    logger.info("Similarity search completed")
     return results
 
-async def generate_answers_with_dual_together_models(questions: List[str], similarity_results: Dict[int, List[Tuple[float, Document]]]) -> List[str]:
-    model_assignments = assign_models_to_questions(questions)
+def build_batched_prompt(question_indices: List[int], questions: List[str], similarity_results: Dict[int, List[Tuple[float, Document]]]) -> str:
     
-    prompt_template = PromptTemplate.from_template(
-        """Based on the provided context, answer the question concisely and accurately in less than 100 words.
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-    )
-    
-    async def generate_single_answer(q_idx: int, question: str, model_instance: str) -> str:
-        loop = asyncio.get_event_loop()
-        
-        def _generate():
-            relevant_chunks = similarity_results.get(q_idx, [])
-            model_info_map = {
-                "model_1": "Together API Model 1 - Llama-3.3-70B-Instruct-Turbo-Free",
-                "model_2": "Together API Model 2 - Llama-3.3-70B-Instruct-Turbo-Free"
-            }
-            
-            qa_log_entry = {
-                "question_index": int(q_idx),
-                "question": str(question),
-                "model_instance": model_instance,
-                "model_info": model_info_map[model_instance],
-                "api_key_used": f"TOGETHER_API_KEY_{model_instance.split('_')[1].upper()}",
-                "extracted_chunks": [],
-                "context_used": "",
-                "prompt": "",
-                "llm_response": "",
-                "error": None,
-                "debug_info": {}
-            }
-            
-            if not relevant_chunks:
-                qa_log_entry["llm_response"] = "I couldn't find relevant information to answer this question in the provided document."
-                qa_log_entry["error"] = "No relevant chunks found"
-                
-                try:
-                    qa_logger.info(safe_json_dumps({
-                        "event": "qa_generation",
-                        "data": qa_log_entry
-                    }, indent=2))
-                except Exception as e:
-                    logger.error(f"Failed to log QA generation: {e}")
-                
-                return qa_log_entry["llm_response"]
+    prompt_parts = [
+        "You will receive multiple questions, each with its own relevant context from a PDF document. "
+        "Answer each question based on its corresponding context. Provide concise answers (less than 100 words per question).\n\n"
+    ]
+    for i, q_idx in enumerate(question_indices, 1):
+        question = questions[q_idx]
+        relevant_chunks = similarity_results.get(q_idx, [])
+        if relevant_chunks:
             context_parts = []
-            for i, (score, chunk) in enumerate(relevant_chunks[:3]):
-                chunk_detail = {
-                    "chunk_number": int(i + 1),
-                    "similarity_score": float(score),
-                    "page": safe_json_serialize(chunk.metadata.get("page", "unknown")),
-                    "content": str(chunk.page_content),
-                    "content_length": int(len(chunk.page_content))
-                }
-                qa_log_entry["extracted_chunks"].append(chunk_detail)
+            for score, chunk in relevant_chunks[:2]: 
                 context_parts.append(chunk.page_content)
             context = "\n\n".join(context_parts)
 
-            qa_log_entry["debug_info"]["original_context_length"] = len(context)
-            qa_log_entry["debug_info"]["context_empty"] = len(context.strip()) == 0
-            
-            if len(context.strip()) == 0:
-                qa_log_entry["error"] = "Context is empty after chunk combination"
-                qa_log_entry["llm_response"] = "Unable to generate answer due to empty context."
-                return qa_log_entry["llm_response"]
-            original_context_length = len(context)
-            if len(context) > 3000:
-                context = context[:3000] + "..."
-                qa_log_entry["context_truncated"] = True
-                qa_log_entry["original_context_length"] = int(original_context_length)
-                qa_log_entry["truncated_context_length"] = int(len(context))
-            
-            qa_log_entry["context_used"] = str(context)
+            if len(context) > 2000:
+                context = context[:2000] + "..."
+        else:
+            context = "No relevant context found in the document."
+        
+        prompt_parts.append(f"Context for Question {i}:")
+        prompt_parts.append(context)
+        prompt_parts.append(f"\nQuestion {i}: {question}\n")
+        prompt_parts.append("-" * 50 + "\n")
+
+    json_format_instruction = f"""
+Please provide your answers in the following JSON format:
+{{
+  "answers": [
+    {{{", ".join([f'"question_{i}": "your answer to question {i}"' for i in range(1, len(question_indices) + 1)])}}}
+  ]
+}}
+
+Make sure to:
+1. Answer each question based on its corresponding context
+2. Keep answers concise (less than 100 words each)
+3. Use proper JSON formatting
+4. Include all {len(question_indices)} answers
+"""
+    
+    prompt_parts.append(json_format_instruction)
+    
+    return "\n".join(prompt_parts)
+
+async def generate_batched_answers(questions: List[str], similarity_results: Dict[int, List[Tuple[float, Document]]]) -> List[str]:
+    model_assignments = assign_questions_to_models(questions)
+    
+    async def process_model_batch(model_instance: str, question_indices: List[int]) -> Dict[str, str]:
+        loop = asyncio.get_event_loop()
+        
+        def _generate_batch():
+            batch_log = {
+                "model_instance": model_instance,
+                "question_indices": question_indices,
+                "questions_count": len(question_indices),
+                "api_key_used": f"TOGETHER_API_KEY_{model_instance.split('_')[1].upper()}",
+                "prompt": "",
+                "raw_response": "",
+                "parsed_answers": {},
+                "error": None
+            }
             
             try:
-                formatted_prompt = prompt_template.format(context=context, question=question)
-                qa_log_entry["prompt"] = str(formatted_prompt)
-                qa_log_entry["debug_info"]["prompt_length"] = len(formatted_prompt)
+                prompt = build_batched_prompt(question_indices, questions, similarity_results)
+                batch_log["prompt"] = prompt
+                batch_log["prompt_length"] = len(prompt)
+                
                 llm = get_llm_model(model_instance)
-                
-                response = llm.invoke([HumanMessage(content=formatted_prompt)])
-                qa_log_entry["debug_info"]["response_type"] = str(type(response))
-                qa_log_entry["debug_info"]["response_is_none"] = response is None
-                
-                if response is None:
-                    raise ValueError(f"{model_instance.upper()} returned None response")
-                
-                logger.info(f"Q{q_idx}: Received response from {model_instance.upper()}")
-                answer = None
+                response = llm.invoke([HumanMessage(content=prompt)])
                 
                 if hasattr(response, 'content') and response.content:
-                    answer = str(response.content).strip()
-                    qa_log_entry["debug_info"]["content_extraction_method"] = "response.content"
+                    raw_response = str(response.content).strip()
                 elif hasattr(response, 'text') and response.text:
-                    answer = str(response.text).strip()
-                    qa_log_entry["debug_info"]["content_extraction_method"] = "response.text"
+                    raw_response = str(response.text).strip()
                 else:
-                    answer = str(response).strip()
-                    qa_log_entry["debug_info"]["content_extraction_method"] = "str(response)"
+                    raw_response = str(response).strip()
                 
-                qa_log_entry["debug_info"]["extracted_answer_length"] = len(answer) if answer else 0
-                qa_log_entry["debug_info"]["answer_is_empty"] = len(answer.strip()) == 0 if answer else True
-                
-                if not answer or len(answer.strip()) == 0:
-                    logger.warning(f"Q{q_idx}: {model_instance.upper()} returned empty response")
-                    qa_log_entry["error"] = f"{model_instance.upper()} returned empty response"
-                    answer = f"The {model_instance.upper()} model returned an empty response. Please try rephrasing your question."
-                
-                qa_log_entry["llm_response"] = answer
+                batch_log["raw_response"] = raw_response
+                try:
+                    json_start = raw_response.find('{')
+                    json_end = raw_response.rfind('}') + 1
+                    
+                    if json_start != -1 and json_end != 0:
+                        json_str = raw_response[json_start:json_end]
+                        parsed_json = json.loads(json_str)
+                        
+                        if "answers" in parsed_json and isinstance(parsed_json["answers"], list) and len(parsed_json["answers"]) > 0:
+                            answers_dict = parsed_json["answers"][0]
+                            batch_log["parsed_answers"] = answers_dict
+                        else:
+                            raise ValueError("Invalid JSON structure: missing 'answers' key or empty list")
+                    else:
+                        raise ValueError("No valid JSON found in response")
+                        
+                except (json.JSONDecodeError, ValueError) as parse_error:
+                    logger.warning(f"{model_instance.upper()}: JSON parsing failed: {parse_error}")
+                    batch_log["error"] = f"JSON parsing failed: {parse_error}"
+                    answers_dict = {}
+                    for i, q_idx in enumerate(question_indices, 1):
+                        question_key = f"question_{i}"
+                        pattern = f"question {i}.*?answer.*?[:.]\\s*([^\\n]*(?:\\n[^\\n]*)*?)(?=question \\d+|$)"
+                        import re
+                        match = re.search(pattern, raw_response.lower(), re.DOTALL | re.IGNORECASE)
+                        if match:
+                            answers_dict[question_key] = match.group(1).strip()
+                        else:
+                            answers_dict[question_key] = f"Unable to parse answer for question {i}"
+                    
+                    batch_log["parsed_answers"] = answers_dict
                 if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                    qa_log_entry["token_usage"] = {
+                    batch_log["token_usage"] = {
                         "input_tokens": safe_json_serialize(getattr(response.usage_metadata, 'input_tokens', None)),
                         "output_tokens": safe_json_serialize(getattr(response.usage_metadata, 'output_tokens', None)),
                         "total_tokens": safe_json_serialize(getattr(response.usage_metadata, 'total_tokens', None))
                     }
-                elif hasattr(response, 'response_metadata') and response.response_metadata:
-                    metadata = response.response_metadata
-                    if 'token_usage' in metadata:
-                        qa_log_entry["token_usage"] = safe_json_serialize(metadata['token_usage'])
-                else:
-                    qa_log_entry["debug_info"]["no_usage_metadata"] = True
                 
-                logger.info(f"Q{q_idx}: Successfully generated answer using {model_instance.upper()}")
+                return batch_log["parsed_answers"]
                 
             except Exception as e:
-                error_msg = f"Error generating answer for question {q_idx} using {model_instance}: {e}"
+                error_msg = f"Error in {model_instance} batch processing: {e}"
                 logger.error(error_msg)
-                logger.error(f"Exception details: {type(e).__name__}: {str(e)}")
-                qa_log_entry["error"] = str(e)
-                qa_log_entry["debug_info"]["exception_type"] = type(e).__name__
-                qa_log_entry["llm_response"] = "Sorry, I encountered an error while generating the answer."
-                answer = qa_log_entry["llm_response"]
-            try:
-                qa_logger.info(safe_json_dumps({
-                    "event": "qa_generation",
-                    "data": qa_log_entry
-                }, indent=2))
-            except Exception as e:
-                logger.error(f"Failed to log QA generation: {e}")
+                batch_log["error"] = str(e)
+                error_answers = {}
+                for i in range(1, len(question_indices) + 1):
+                    error_answers[f"question_{i}"] = f"Error generating answer: {e}"
+                
+                return error_answers
             
-            return answer
+            finally:
+                try:
+                    pass
+                except Exception as log_error:
+                    logger.error(f"Failed to log batch processing: {log_error}")
         
-        return await loop.run_in_executor(None, _generate)
-
-    tasks = [
-        generate_single_answer(i, question, model_assignments[i]) 
-        for i, question in enumerate(questions)
-    ]
-    answers = await asyncio.gather(*tasks)
+        return await loop.run_in_executor(None, _generate_batch)
     
-    return answers
+    model_1_task = process_model_batch("model_1", model_assignments["model_1"])
+    model_2_task = process_model_batch("model_2", model_assignments["model_2"])
+    model_3_task = process_model_batch("model_3", model_assignments["model_3"])
+    
+    model_1_answers, model_2_answers, model_3_answers = await asyncio.gather(
+        model_1_task, model_2_task, model_3_task)
+    
+    all_answers = [""] * len(questions)
+
+    for i, q_idx in enumerate(model_assignments["model_1"]):
+        question_key = f"question_{i + 1}"
+        if question_key in model_1_answers:
+            all_answers[q_idx] = model_1_answers[question_key]
+        else:
+            all_answers[q_idx] = "No answer provided by model 1"
+    
+    for i, q_idx in enumerate(model_assignments["model_2"]):
+        question_key = f"question_{i + 1}"
+        if question_key in model_2_answers:
+            all_answers[q_idx] = model_2_answers[question_key]
+        else:
+            all_answers[q_idx] = "No answer provided by model 2"
+    
+    for i, q_idx in enumerate(model_assignments["model_3"]):
+        question_key = f"question_{i + 1}"
+        if question_key in model_3_answers:
+            all_answers[q_idx] = model_3_answers[question_key]
+        else:
+            all_answers[q_idx] = "No answer provided by model 3"
+    
+    return all_answers
 
 async def pipeline(pdf_url: str, questions: List[str]) -> List[str]:
 
-    model_assignments = assign_models_to_questions(questions)
-    model_1_count = sum(1 for m in model_assignments.values() if m == "model_1")
-    model_2_count = sum(1 for m in model_assignments.values() if m == "model_2")
-    
-    pipeline_log = {
-        "event": "pipeline_start",
-        "pdf_url": str(pdf_url),
-        "questions_count": int(len(questions)),
-        "questions": [str(q) for q in questions],
-        "timestamp": datetime.now().isoformat(),
-        "api_provider": "Dual Together API",
-        "model_distribution": {
-            "model_1": {
-                "questions_assigned": model_1_count,
-                "api_key": "TOGETHER_API_KEY_1",
-                "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"
-            },
-            "model_2": {
-                "questions_assigned": model_2_count,
-                "api_key": "TOGETHER_API_KEY_2", 
-                "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"
-            }
-        }
-    }
-    
     try:
-        qa_logger.info(safe_json_dumps(pipeline_log, indent=2))
+        pass
     except Exception as e:
         logger.error(f"Failed to log pipeline start: {e}")
     doc_hash = get_cached_document_hash(pdf_url)
     cache_key = (doc_hash, tuple(questions))
     
     if cache_key in answer_cache:
-        logger.info("Returning cached answers")
         try:
-            qa_logger.info(safe_json_dumps({
-                "event": "cache_hit",
-                "doc_hash": str(doc_hash),
-                "questions_count": int(len(questions))
-            }, indent=2))
+
+            pass
         except Exception as e:
             logger.error(f"Failed to log cache hit: {e}")
         return answer_cache[cache_key]
     
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             pdf_future = executor.submit(asyncio.run, download_pdf_async(pdf_url))
-            embedding_future = executor.submit(get_embedding_model)
-            model_1_future = executor.submit(get_together_model_1)
-            model_2_future = executor.submit(get_together_model_2)
             
             pdf_content = pdf_future.result()
-            embedding_model = embedding_future.result()
-            together_model_1 = model_1_future.result()
-            together_model_2 = model_2_future.result()
+
         if doc_hash in document_cache:
-            logger.info("Using cached document chunks")
             chunks = document_cache[doc_hash]
         else:
             docs = extract_text_from_pdf(pdf_content)
@@ -529,62 +507,38 @@ async def pipeline(pdf_url: str, questions: List[str]) -> List[str]:
             document_cache[doc_hash] = chunks
             
             try:
-                qa_logger.info(safe_json_dumps({
-                    "event": "document_processing",
-                    "data": {
-                        "total_pages": int(len(docs)),
-                        "total_chunks": int(len(chunks)),
-                        "doc_hash": str(doc_hash),
-                        "chunk_sizes": [int(len(chunk.page_content)) for chunk in chunks[:10]]
-                    }
-                }, indent=2))
+                pass
             except Exception as e:
                 logger.error(f"Failed to log document processing: {e}")
 
         similarity_results = vectorized_similarity_search(chunks, questions)
 
-        answers = await generate_answers_with_dual_together_models(questions, similarity_results)
-
+        answers = await generate_batched_answers(questions, similarity_results)
+        
         answer_cache[cache_key] = answers
 
         try:
-            qa_logger.info(safe_json_dumps({
-                "event": "pipeline_complete",
-                "doc_hash": str(doc_hash),
-                "questions_count": int(len(questions)),
-                "answers_generated": int(len(answers)),
-                "timestamp": datetime.now().isoformat(),
-                "api_provider": "Dual Together API",
-                "model_usage": {
-                    "model_1_questions": model_1_count,
-                    "model_2_questions": model_2_count
-                }
-            }, indent=2))
+            pass
         except Exception as e:
             logger.error(f"Failed to log pipeline completion: {e}")
-        
+
         if len(answer_cache) > 100:
             keys_to_remove = list(answer_cache.keys())[:-50]
             for key in keys_to_remove:
                 del answer_cache[key]
             gc.collect()
-        
+
         return answers
         
     except Exception as e:
-        error_log = {
-            "event": "pipeline_error",
-            "error": str(e),
-            "pdf_url": str(pdf_url),
-            "questions_count": int(len(questions)),
-            "api_provider": "Dual Together API"
-        }
         
         try:
-            qa_logger.error(safe_json_dumps(error_log, indent=2))
+            pass
         except Exception as log_error:
             logger.error(f"Failed to log pipeline error: {log_error}")
         
         logger.error(f"Error in pipeline: {e}")
         raise
+
+
 
